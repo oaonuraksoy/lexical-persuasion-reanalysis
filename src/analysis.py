@@ -466,13 +466,26 @@ def corpus_b() -> tuple[dict, pd.DataFrame]:
     return R, d
 
 
+def _round(x, sig: int = 10):
+    """Round floats to `sig` significant digits so results.json is identical across platforms."""
+    if isinstance(x, dict):
+        return {k: _round(v, sig) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_round(v, sig) for v in x]
+    if isinstance(x, (float, np.floating)):
+        return float(f"{float(x):.{sig}g}")
+    if isinstance(x, np.integer):
+        return int(x)
+    return x
+
+
 def main() -> None:
     check_disjoint()
     OUT.mkdir(exist_ok=True)
     rng = np.random.default_rng(SEED)
     ra, a, args = corpus_a(rng)
     rb, d = corpus_b()
-    res = {"corpus_a": ra, "corpus_b": rb, "seed": SEED, "n_boot": N_BOOT}
+    res = _round({"corpus_a": ra, "corpus_b": rb, "seed": SEED, "n_boot": N_BOOT})
     (OUT / "results.json").write_text(json.dumps(res, indent=2, default=float), encoding="utf-8")
     args.drop(columns=["argument"]).to_csv(OUT / "corpus_a_arguments.csv")
     d.drop(columns=["url"]).to_csv(OUT / "corpus_b_documents.csv", index=False)
