@@ -1,8 +1,8 @@
-# Lexical cues in LLM persuasion and in web search sources
+# Negative belief shifts after LLM-written arguments and the limits of lexical cues
 
 Code, word lists and results for the preprint
 
-> Aksoy, O. (2026). *Lexical Cues in LLM Persuasion and in Web Search Sources: A Reanalysis of Two Public Benchmarks.* Preprints.org.
+> Aksoy, O. (2026). *Negative Belief Shifts after LLM-Written Arguments and the Limits of Lexical Cues: A Reanalysis of Two Public Benchmarks.* Preprints.org.
 
 The analysis uses two public datasets:
 
@@ -23,7 +23,7 @@ python src/figures.py       # figures/*.pdf, figures/*.png, figures/graphical_ab
 python src/tables.py        # tables/*.tex
 ```
 
-`analysis.py` takes about 20 seconds on a laptop. The random seed is fixed (`SEED` in `src/analysis.py`).
+`analysis.py` takes about a minute on a laptop. The random seed is fixed (`SEED` in `src/analysis.py`).
 
 ## Layout
 
@@ -41,6 +41,8 @@ Figures and tables are not stored in the repository; the two scripts recreate th
 - Each argument in Anthropic/persuasion was rated by three workers, so comparisons of belief change use argument means; confidence intervals resample arguments.
 - Query intent in GEO-bench: `transactional` tag → Transactional; else `opinion` or `debate` tag → Opinion/Debate; else Informational.
 - Word lists match the listed word or the word plus "s"/"es"; the lists are pairwise disjoint (checked at run time).
+- Negative shifts: claim-stratified Cochran-Mantel-Haenszel and within-claim permutation tests, and a logistic GEE for text features (`negative_shift_analysis`).
+- A TF-IDF bag-of-words model checks that the prediction results do not depend on the word lists (`tfidf_check`).
 
 ## Licence
 

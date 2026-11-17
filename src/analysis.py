@@ -10,15 +10,18 @@ from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
+import statsmodels.api as sm
 import statsmodels.formula.api as smf
 from scipy import stats
 from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
-from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression, Ridge, RidgeCV
 from sklearn.metrics import r2_score, roc_auc_score
 from sklearn.model_selection import GroupKFold
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from statsmodels.stats.multitest import multipletests
+from statsmodels.stats.contingency_tables import StratifiedTable
 from statsmodels.stats.proportion import proportion_confint
 
 from features import AFF_REL, ANALYTIC, check_disjoint, text_features
@@ -101,6 +104,7 @@ def load_a() -> tuple[pd.DataFrame, pd.DataFrame]:
     a = a.join(feats, on="argument")
     g = a.groupby("arg_id")
     args = g.agg(source=("source", "first"), prompt_type=("prompt_type", "first"), claim=("claim", "first"),
+                 argument=("argument", "first"),
                  y=("y", "mean"), neg=("neg", "sum"), n=("y", "size"), init=("init", "mean"))
     args = args.join(g[list(feats.columns)].first())
     return a, args
@@ -271,7 +275,97 @@ def corpus_a(rng) -> dict:
     R["cv_n"] = {"trials": len(cv), "claims": int(cv.claim.nunique())}
     r = stats.pearsonr(cv.init, cv.y)
     R["init_insample"] = {"r": float(r.statistic), "r2": float(r.statistic ** 2), "p": float(r.pvalue)}
+    R["negative"] = negative_shift_analysis(a, args)
+    R["tfidf"] = tfidf_check(cv, av)
     return R, a, args
+
+
+# --------------------------------------------------------------------------- negative shifts in depth
+def negative_shift_analysis(a: pd.DataFrame, args: pd.DataFrame) -> dict:
+    out: dict = {}
+    h, c = a[a.source == "Human"], a[a.is_claude]
+    out["distribution"] = {n: {"neg": float((d.y < 0).mean()), "zero": float((d.y == 0).mean()),
+                               "pos": float((d.y > 0).mean()), "n": len(d)} for n, d in [("human", h), ("claude", c)]}
+    # claim-stratified comparison at the argument level (Cochran-Mantel-Haenszel)
+    pa = args[args.source.str.startswith("Claude") | (args.source == "Human")].copy()
+    pa["any_neg"] = (pa.neg > 0).astype(int)
+    pa["human"] = (pa.source == "Human").astype(int)
+    tables = []
+    for _, g in pa.groupby("claim"):
+        ch, hh = g[g.human == 0], g[g.human == 1]
+        tables.append(np.array([[ch.any_neg.sum(), len(ch) - ch.any_neg.sum()],
+                                [hh.any_neg.sum(), len(hh) - hh.any_neg.sum()]], dtype=float))
+    st = StratifiedTable(tables)
+    t = st.test_null_odds(correction=True)
+    claude_claims = int(pa[pa.human == 0].groupby("claim").any_neg.max().sum())
+    out["cmh_claims"] = {"chi2": float(t.statistic), "p": float(t.pvalue), "n_claims": len(tables),
+                         "claims_with_claude_neg": claude_claims,
+                         "claims_with_human_neg": int(pa[pa.human == 1].groupby("claim").any_neg.max().sum())}
+    # permutation test within claims: shuffle the human/Claude label among arguments of the same claim
+    rng = np.random.default_rng(SEED + 1)
+    obs = int(pa[pa.human == 1].any_neg.sum())
+    groups = [g[["human", "any_neg"]].to_numpy() for _, g in pa.groupby("claim")]
+    n_perm, le = 20_000, 0
+    for _ in range(n_perm):
+        s = 0
+        for g in groups:
+            lab = rng.permutation(g[:, 0])
+            s += int(g[lab == 1, 1].sum())
+        le += s <= obs
+    out["perm_within_claim"] = {"observed_human_args_with_neg": obs, "p_one_sided": (le + 1) / (n_perm + 1),
+                                "n_perm": n_perm}
+    # argument-level rates by model and prompt (Claude only)
+    ca = pa[pa.human == 0]
+    for key, col in [("by_model", "source"), ("by_prompt", "prompt_type")]:
+        tab = pd.crosstab(ca[col], ca.any_neg)
+        chi = stats.chi2_contingency(tab)
+        out[key] = {"rates": (ca.groupby(col).any_neg.mean()).to_dict(), "chi2": float(chi[0]), "p": float(chi[1])}
+    # which text features go with negative shifts? Claude ratings whose reader could move down (initial >= 2)
+    cc = c[c.init >= 2].copy()
+    feats = TEXT_FEATS
+    for f in feats:
+        cc["z_" + f] = (cc[f] - cc[f].mean()) / cc[f].std(ddof=0)
+    form = "neg ~ " + " + ".join("z_" + f for f in feats) + " + C(init) + C(prompt_type) + C(source)"
+    m = smf.gee(form, groups="arg_id", data=cc, family=sm.families.Binomial(),
+                cov_struct=sm.cov_struct.Exchangeable()).fit()
+    coef = {f: {"or": float(np.exp(m.params["z_" + f])), "p": float(m.pvalues["z_" + f]),
+                "ci": [float(np.exp(m.conf_int().loc["z_" + f, 0])), float(np.exp(m.conf_int().loc["z_" + f, 1]))]}
+            for f in feats}
+    for f, q in zip(feats, bh([coef[f]["p"] for f in feats])):
+        coef[f]["q"] = q
+    out["gee_claude"] = {"n": len(cc), "clusters": int(cc.arg_id.nunique()), "events": int(cc.neg.sum()), "coef": coef}
+    return out
+
+
+# --------------------------------------------------------------------------- lexicon-free check
+def tfidf_check(cv: pd.DataFrame, av: pd.DataFrame) -> dict:
+    """Bag-of-words (TF-IDF unigrams and bigrams) instead of the word lists, claim-grouped 5-fold CV."""
+    gkf = GroupKFold(n_splits=5)
+    alphas = np.logspace(-1, 4, 11)
+
+    def vec():
+        return TfidfVectorizer(ngram_range=(1, 2), min_df=3, sublinear_tf=True, stop_words=None)
+
+    out = {}
+    # ratings level
+    pred = np.zeros(len(cv)); ppos = np.zeros(len(cv)); pneg = np.zeros(len(cv))
+    for tr, te in gkf.split(cv, cv.y, cv.claim):
+        v = vec().fit(cv.argument.iloc[tr])
+        Xtr, Xte = v.transform(cv.argument.iloc[tr]), v.transform(cv.argument.iloc[te])
+        pred[te] = RidgeCV(alphas=alphas).fit(Xtr, cv.y.values[tr]).predict(Xte)
+        ppos[te] = LogisticRegression(C=1.0, max_iter=3000).fit(Xtr, cv.pos.values[tr]).predict_proba(Xte)[:, 1]
+        pneg[te] = LogisticRegression(C=1.0, max_iter=3000, class_weight="balanced").fit(
+            Xtr, cv.neg.values[tr]).predict_proba(Xte)[:, 1]
+    out["ratings"] = {"r2": float(r2_score(cv.y, pred)), "auroc_pos": float(roc_auc_score(cv.pos, ppos)),
+                      "auroc_neg": float(roc_auc_score(cv.neg, pneg)), "n": len(cv)}
+    # argument level (mean of three ratings)
+    pred = np.zeros(len(av))
+    for tr, te in gkf.split(av, av.y, av.claim):
+        v = vec().fit(av.argument.iloc[tr])
+        pred[te] = RidgeCV(alphas=alphas).fit(v.transform(av.argument.iloc[tr]), av.y.values[tr]).predict(
+            v.transform(av.argument.iloc[te]))
+    out["arguments"] = {"r2": float(r2_score(av.y, pred)), "n": len(av)}
+    return out
 
 
 # --------------------------------------------------------------------------- Corpus B
@@ -380,7 +474,7 @@ def main() -> None:
     rb, d = corpus_b()
     res = {"corpus_a": ra, "corpus_b": rb, "seed": SEED, "n_boot": N_BOOT}
     (OUT / "results.json").write_text(json.dumps(res, indent=2, default=float), encoding="utf-8")
-    args.drop(columns=[]).to_csv(OUT / "corpus_a_arguments.csv")
+    args.drop(columns=["argument"]).to_csv(OUT / "corpus_a_arguments.csv")
     d.drop(columns=["url"]).to_csv(OUT / "corpus_b_documents.csv", index=False)
     print("wrote", OUT / "results.json")
 

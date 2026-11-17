@@ -174,36 +174,76 @@ def fig4():
     save(fig, "fig4_geobench")
 
 
+def fig_negative():
+    t = A["table1"]
+    neg = A["negative"]
+    g = neg["gee_claude"]["coef"]
+    from statsmodels.stats.proportion import proportion_confint
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.2, 3.1), gridspec_kw={"wspace": 0.85, "width_ratios": [1.1, 1]})
+    srcs = ["Claude 1.3", "Claude Instant 1.2", "Claude 2", "Claude 3 Haiku", "Claude 3 Opus", "Human"]
+    labs = ["Claude 1.3", "Claude Instant 1.2", "Claude 2", "Claude 3 Haiku", "Claude 3 Opus", "Human"]
+    y = np.arange(len(srcs))[::-1]
+    for yi, s in zip(y, srcs):
+        k, n = t[s]["args_with_neg"], t[s]["args"]
+        lo, hi = proportion_confint(k, n, method="wilson")
+        col = ORANGE if s == "Human" else BLUE
+        ax1.errorbar(100 * k / n, yi, xerr=[[100 * (k / n - lo)], [100 * (hi - k / n)]], fmt="o", color=col,
+                     ms=5, capsize=2, elinewidth=1)
+        ax1.text(100 * hi + 1, yi, f"{k}/{n}", va="center", fontsize=7)
+    ax1.set_yticks(y, labs, fontsize=7.5)
+    ax1.set_xlim(0, 35)
+    ax1.set_xlabel("Arguments with ≥1 negative rating (%, Wilson 95% CI)")
+    ax1.set_title("(a) Negative shifts by author")
+    feats = list(FEAT_LABEL)
+    yy = np.arange(len(feats))[::-1]
+    ors = [g[f]["or"] for f in feats]
+    lo = [g[f]["or"] - g[f]["ci"][0] for f in feats]
+    hi = [g[f]["ci"][1] - g[f]["or"] for f in feats]
+    ax2.axvline(1, color="black", lw=0.6)
+    ax2.errorbar(ors, yy, xerr=[lo, hi], fmt="s", color=BLUE, ms=4, capsize=2, elinewidth=0.9)
+    ax2.set_yticks(yy, [FEAT_LABEL[f] for f in feats], fontsize=7)
+    ax2.set_xlim(0.6, 1.5)
+    ax2.set_xlabel("Odds ratio per SD (GEE, 95% CI)")
+    ax2.set_title("(b) Text features and negative shifts")
+    save(fig, "fig_negative")
+
+
 def graphical_abstract():
     t, cp = A["table1"], A["claude_pooled"]
     tost = A["tost_args"]
     cv = A["cv"]
     fr = B["rank_friedman"]
+    neg = A["negative"]
+    nf = A["neg_args_fisher"]
+    tf = A["tfidf"]
     fig = plt.figure(figsize=(12, 6), dpi=200)
     fig.patch.set_facecolor("white")
-    fig.text(0.5, 0.94, "Lexical Cues in LLM Persuasion and in Web Search Sources", ha="center",
-             fontsize=19, weight="bold", color="#1a1a1a")
+    fig.text(0.5, 0.94, "Negative Belief Shifts after LLM Arguments and the Limits of Lexical Cues",
+             ha="center", fontsize=18, weight="bold", color="#1a1a1a")
     fig.text(0.5, 0.885, "Reanalysis of Anthropic/persuasion (3,939 ratings of 1,313 arguments) and GEO-bench "
              "(4,996 pages for 1,000 queries)", ha="center", fontsize=11.5, color="#444")
     panels = [
         ("Human vs. Claude arguments", BLUE, [
-            f"Claude 3 Opus {t['Claude 3 Opus']['mean']:.2f} vs. human {t['Human']['mean']:.2f}",
-            "mean shift; no detectable difference",
-            f"(argument-level p = {A['mw_args']['opus_vs_human']['p']:.2f}), equivalent",
-            f"only within ±0.20 (p = {tost['0.2']['p_tost']:.3f})",
+            f"Arguments with ≥1 negative shift:",
+            f"Claude {nf['claude'][0]} of {nf['claude'][1]:,} vs. human {nf['human'][0]} of {nf['human'][1]}",
+            f"Claude: {neg['cmh_claims']['claims_with_claude_neg']} of 56 claims; human: "
+            f"{neg['cmh_claims']['claims_with_human_neg']} of 56",
+            "Same claims, same starting attitudes;",
+            "no difference between Claude models",
             "",
-            f"Negative shifts: {100 * cp['neg_k'] / cp['n']:.1f}% of Claude ratings",
-            f"vs. {100 * t['Human']['neg_rate']:.1f}% of human ratings (1 of 522),",
-            "same claims, same initial attitudes",
+            f"Mean shift: Opus {t['Claude 3 Opus']['mean']:.2f}, human {t['Human']['mean']:.2f};",
+            f"equivalent only within ±0.20",
         ]),
         ("Do the words predict shift?", ORANGE, [
-            "Pooled correlations shrink once",
+            "Word-list associations shrink once",
             "prompt type and initial rating",
             "are controlled",
             "",
-            "Unseen claims, text features only:",
-            f"R² = {cv['ridge_text']['r2']:.3f} (ridge), {cv['hgbt_text']['r2']:.3f} (boosting)",
-            f"Initial rating alone: R² = {cv['ridge_init']['r2']:.3f} to {cv['hgbt_init']['r2']:.3f}",
+            "Unseen claims, text only:",
+            f"word lists R² = {cv['ridge_text']['r2']:.3f}",
+            f"all words (TF-IDF) R² = {tf['ratings']['r2']:.3f}",
+            "No word feature predicts",
+            "negative shifts",
         ]),
         ("Google top-5 pages (GEO-bench)", GREEN, [
             "Cue rates barely change",
@@ -231,9 +271,8 @@ def graphical_abstract():
         ax.text(0.5, 0.91, title, ha="center", fontsize=12.5, weight="bold", color=col, transform=ax.transAxes)
         for j, line in enumerate(lines):
             ax.text(0.05, 0.77 - j * 0.076, line, fontsize=10.5, transform=ax.transAxes, color="#1a1a1a")
-    fig.text(0.5, 0.075, "Word counts explain almost none of the variation in belief change; "
-             "prompt type and readers' starting attitudes matter more.", ha="center", fontsize=12.5,
-             weight="bold", color="#1a1a1a")
+    fig.text(0.5, 0.075, "Claude arguments moved some readers the wrong way far more often than human arguments; "
+             "word counts do not explain why.", ha="center", fontsize=12.5, weight="bold", color="#1a1a1a")
     fig.savefig(FIG / "graphical_abstract.png", dpi=200)
     plt.close(fig)
 
@@ -243,5 +282,6 @@ if __name__ == "__main__":
     fig2()
     fig3()
     fig4()
+    fig_negative()
     graphical_abstract()
     print("figures written to", FIG)
