@@ -1,0 +1,6 @@
+data/
+paper/
+figures/
+tables/
+__pycache__/
+*.pyc
